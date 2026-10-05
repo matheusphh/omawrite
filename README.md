@@ -16,6 +16,8 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
 - `Ctrl+Shift+S` saves as.
 - `Ctrl+O` opens a Markdown file through the portal picker.
 - `Ctrl+P` opens the system print dialog.
+- `Ctrl+Shift+P` shows or hides a rendered preview beside the editor. Omawrite
+  remembers the choice, and the preview scrolls along with the editor.
 - `Ctrl+N` opens a new Omawrite window.
 - `Ctrl+Z`, `Ctrl+Shift+Z`, and `Ctrl+Y` handle undo and redo.
 - `Super+F` toggles fullscreen. Qt maps this key as `Meta+F`.
@@ -28,7 +30,8 @@ Unsaved drafts are recovered after an abnormal exit. Omawrite also watches open 
 and warns before an external change can replace local work.
 
 The font button in the footer picks the writing font from any installed text font,
-and Omawrite remembers the choice. IBM Plex Mono is the default.
+and Omawrite remembers the choice. IBM Plex Mono is the default. The preview
+button next to it toggles the rendered side-by-side preview.
 
 Text follows the desktop text size — `omarchy display text size`, or GNOME's
 `text-scaling-factor` — and re-flows without a restart. The default of 12px leaves

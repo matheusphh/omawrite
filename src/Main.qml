@@ -27,9 +27,18 @@ ApplicationWindow {
     readonly property real textScale: backend.textScale
     readonly property int editorFontPixelSize: scaledSize(20)
     readonly property int footerHeight: scaledSize(32)
+    // The preview takes the right half, split on a gutter wide enough to read
+    // as a seam rather than a rule.
+    readonly property bool previewOn: backend.previewVisible
+    readonly property int previewGutter: scaledSize(48)
+    readonly property real editorPaneWidth: previewOn
+        ? Math.max(0, (width - previewGutter) / 2)
+        : width
     readonly property int editorWidth: Math.min(
-        Math.round(writerFontMetrics.averageCharacterWidth * 65),
-        Math.max(360, width - Math.round(writerFontMetrics.averageCharacterWidth * 20)))
+        editorPaneWidth,
+        Math.min(
+            Math.round(writerFontMetrics.averageCharacterWidth * 65),
+            Math.max(360, editorPaneWidth - Math.round(writerFontMetrics.averageCharacterWidth * 20))))
     property bool closeConfirmed: false
     property bool searchOpen: false
     property bool searchUpdating: false
@@ -90,6 +99,26 @@ ApplicationWindow {
         win.visibility = win.visibility === Window.FullScreen
             ? Window.Windowed
             : Window.FullScreen;
+    }
+
+    function togglePreview() {
+        backend.previewVisible = !backend.previewVisible;
+        if (editor.activeFocus)
+            editor.forceActiveFocus();
+    }
+
+    // Keep the preview roughly level with the editor as the page grows, so the
+    // text being written stays in view beside its rendering.
+    function syncPreviewScroll() {
+        if (!win.previewOn)
+            return;
+
+        var editorRange = Math.max(0, editorFlick.contentHeight - editorFlick.height);
+        var previewRange = Math.max(0, previewFlick.contentHeight - previewFlick.height);
+        if (editorRange <= 0 || previewRange <= 0)
+            return;
+
+        previewFlick.contentY = Math.round(editorFlick.contentY / editorRange * previewRange);
     }
 
     function updateSearch() {
@@ -201,6 +230,12 @@ ApplicationWindow {
         sequence: "Ctrl+P"
         context: Qt.ApplicationShortcut
         onActivated: backend.printDocument()
+    }
+
+    Shortcut {
+        sequence: "Ctrl+Shift+P"
+        context: Qt.ApplicationShortcut
+        onActivated: win.togglePreview()
     }
 
     Shortcut {
@@ -332,7 +367,7 @@ ApplicationWindow {
         standardButtons: Dialog.Close
         anchors.centerIn: parent
         contentItem: Label {
-            text: "Ctrl+S  Save\nCtrl+Shift+S  Save As\nCtrl+O  Open\nCtrl+N  New Window\nCtrl+F  Find\nCtrl+H  Find and Replace\nCtrl+B  Bold\nCtrl+I  Italic\nCtrl+K  Link\nCtrl+P  Print\nF11 / Super+F  Fullscreen\nCtrl+?  Shortcuts"
+            text: "Ctrl+S  Save\nCtrl+Shift+S  Save As\nCtrl+O  Open\nCtrl+N  New Window\nCtrl+F  Find\nCtrl+H  Find and Replace\nCtrl+B  Bold\nCtrl+I  Italic\nCtrl+K  Link\nCtrl+P  Print\nCtrl+Shift+P  Toggle Preview\nF11 / Super+F  Fullscreen\nCtrl+?  Shortcuts"
             lineHeight: 1.5
         }
     }
@@ -342,9 +377,14 @@ ApplicationWindow {
 
         Flickable {
             id: editorFlick
-            anchors.fill: parent
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
             anchors.leftMargin: 24
-            anchors.rightMargin: 24
+            // Anchored to the gutter rather than sized, so the editor column
+            // stays centred in whichever half of the window it occupies.
+            anchors.right: win.previewOn ? splitGutter.left : parent.right
+            anchors.rightMargin: win.previewOn ? 0 : 24
             // Inset the scrolling area by the footer strip at both ends, so
             // scrolled text never runs under the footer buttons, status, or
             // word count, and stops just as far short of the top edge.
@@ -354,6 +394,7 @@ ApplicationWindow {
             contentWidth: width
             contentHeight: Math.max(height, editor.y + editor.implicitHeight + 220)
             boundsBehavior: Flickable.StopAtBounds
+            onContentYChanged: win.syncPreviewScroll()
             ScrollBar.vertical: ScrollBar {
                 policy: ScrollBar.AsNeeded
                 // Wheel scrolling moves contentY directly rather than
@@ -799,6 +840,86 @@ ApplicationWindow {
             }
         }
 
+        Item {
+            id: splitGutter
+            objectName: "previewGutter"
+            visible: win.previewOn
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            // Anchored horizontally rather than filling, so the editor's right
+            // edge and the preview's left edge both resolve against it.
+            width: visible ? win.previewGutter : 0
+            x: win.previewOn ? (parent.width - width) / 2 : parent.width
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 1
+                height: Math.min(parent.height * 0.4, win.scaledSize(220))
+                color: win.darkMode ? "#3c3c39" : "#d5d5cd"
+            }
+        }
+
+        Flickable {
+            id: previewFlick
+            objectName: "previewFlick"
+            visible: win.previewOn
+            anchors.left: splitGutter.right
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.rightMargin: 24
+            anchors.topMargin: win.footerHeight
+            anchors.bottomMargin: win.footerHeight
+            clip: true
+            contentWidth: width
+            contentHeight: Math.max(height, preview.y + preview.implicitHeight + 220)
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AsNeeded
+            }
+
+            TextEdit {
+                id: preview
+                objectName: "renderedPreview"
+                x: Math.round((previewFlick.width - width) / 2)
+                y: Math.max(0, Math.max(42, Math.round(win.height * 0.05)) - win.footerHeight)
+                // Match the editor's column so both halves line up, but never
+                // wider than the pane actually is.
+                width: Math.min(win.editorPaneWidth, previewFlick.width)
+                height: Math.max(previewFlick.height - y - 96, implicitHeight + 20)
+                // The document is filled in by the backend from the editor's
+                // text, so `text` is deliberately left unbound here.
+                readOnly: true
+                selectByMouse: true
+                wrapMode: TextEdit.Wrap
+                textFormat: TextEdit.RichText
+                color: win.textColor
+                selectedTextColor: win.strongTextColor
+                selectionColor: win.selectionFill
+                activeFocusOnPress: false
+                renderType: Screen.devicePixelRatio % 1 === 0 ? TextEdit.NativeRendering : TextEdit.QtRendering
+                cursorDelegate: Rectangle {
+                    width: 1
+                    color: win.strongTextColor
+                }
+                onLinkActivated: function(link) { backend.openExternalUrl(link); }
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    text: "# Start writing"
+                    // Taken from the editor rather than from `preview.text`,
+                    // which is always full of markup even for an empty document.
+                    visible: editor.text.length === 0 && win.previewOn
+                    color: win.mutedColor
+                    font.family: backend.editorFont
+                    font.pixelSize: backend.previewFontPixelSize
+                }
+
+                Component.onCompleted: backend.attachPreview(textDocument)
+            }
+        }
+
         Row {
             id: footerStatus
             anchors.left: parent.left
@@ -831,6 +952,15 @@ ApplicationWindow {
                 iconColor: win.mutedColor
                 tooltip: "Font"
                 onClicked: fontPicker.opened ? fontPicker.close() : fontPicker.open()
+            }
+
+            FooterIconButton {
+                id: modeToggle
+                objectName: "modeToggle"
+                iconName: "preview"
+                iconColor: win.previewOn ? backend.themeAccent : win.mutedColor
+                tooltip: win.previewOn ? "Hide preview" : "Show preview"
+                onClicked: win.togglePreview()
             }
 
             Label {

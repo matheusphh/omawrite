@@ -12,6 +12,7 @@
 #include <memory>
 
 class MarkdownHighlighter;
+class QFont;
 class QTextDocument;
 class QWindow;
 class QLockFile;
@@ -30,6 +31,8 @@ class Backend : public QObject {
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeColorsChanged)
     Q_PROPERTY(QString themeSelection READ themeSelection NOTIFY themeColorsChanged)
     Q_PROPERTY(QString editorFont READ editorFont WRITE setEditorFont NOTIFY editorFontChanged)
+    Q_PROPERTY(bool previewVisible READ previewVisible WRITE setPreviewVisible NOTIFY previewVisibleChanged)
+    Q_PROPERTY(int previewFontPixelSize READ previewFontPixelSize NOTIFY previewFontPixelSizeChanged)
     Q_PROPERTY(QStringList availableFonts READ availableFonts CONSTANT)
 
 public:
@@ -54,14 +57,26 @@ public:
     QString themeSelection() const { return m_themeSelection; }
     QString editorFont() const { return m_editorFont; }
     void setEditorFont(const QString &family);
+    bool previewVisible() const { return m_previewVisible; }
+    void setPreviewVisible(bool visible);
+    int previewFontPixelSize() const;
     QStringList availableFonts() const;
     static QString defaultEditorFont();
     static QStringList selectableFontFamilies(const QStringList &families);
     static int countWords(const QString &text);
     static QString normalizedLinkUrl(const QString &clipboardText);
     static QString suggestedFileName(const QString &text);
+    // The single Markdown renderer behind both the preview pane and printing.
+    // `foreground`, `muted`, and `accent` are passed in rather than taken from
+    // the theme so that printing can ask for ink-on-paper colours. Renders into
+    // `target` in place, since QTextDocument is neither copyable nor assignable.
+    static void renderMarkdown(QTextDocument *target, const QString &text,
+                               const QFont &font, const QString &foreground,
+                               const QString &muted, const QString &accent);
+    static QString mutedColorFor(bool darkMode);
 
     Q_INVOKABLE void attachDocument(QObject *textDocument);
+    Q_INVOKABLE void attachPreview(QObject *textDocument);
     Q_INVOKABLE void openDialog();
     Q_INVOKABLE void open(const QUrl &url);
     Q_INVOKABLE void save();
@@ -93,6 +108,8 @@ signals:
     void textScaleChanged();
     void themeColorsChanged();
     void editorFontChanged();
+    void previewVisibleChanged();
+    void previewFontPixelSizeChanged();
     void closeAfterSave();
     void openDialogRequested();
     void saveDialogRequested(const QUrl &suggestedUrl);
@@ -110,6 +127,9 @@ private:
     void setWordCount(int words);
     void refreshWordCount();
     void scheduleWordCount();
+    void schedulePreview();
+    void refreshPreview();
+    QFont previewFont() const;
     void applyDocumentTypography();
     void reapplyTypographyToChange();
     void scheduleRecovery();
@@ -150,5 +170,8 @@ private:
     QString m_themeAccent;
     QString m_themeSelection;
     QString m_editorFont;
+    bool m_previewVisible = false;
+    QPointer<QTextDocument> m_previewDocument;
+    QTimer m_previewTimer;
     QFileSystemWatcher m_themeWatcher;
 };

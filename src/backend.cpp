@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QFont>
 #include <QFontDatabase>
 #include <QDesktopServices>
 #include <QGuiApplication>
@@ -23,8 +24,10 @@
 #include <QSaveFile>
 #include <QTextBlock>
 #include <QTextBlockFormat>
+#include <QTextCharFormat>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QTextFragment>
 #include <QTextStream>
 #include <QUrl>
 #include <QVariantMap>
@@ -37,6 +40,17 @@
 constexpr qreal typoraLineHeightPercent = 140;
 const QString lastSaveDirectorySetting = QStringLiteral("file/lastSaveDirectory");
 const QString editorFontSetting = QStringLiteral("editor/font");
+const QString previewVisibleSetting = QStringLiteral("window/previewVisible");
+
+// The preview mirrors the editor's body size, which Main.qml expresses as
+// scaledSize(20); keeping the base here lets the renderer size headings in
+// turn without a round trip through QML.
+constexpr qreal basePreviewFontPixelSize = 20;
+constexpr qreal previewRefreshIntervalMs = 120;
+
+// Qt's Markdown writer emits a block quote as an indented paragraph rather than
+// a <blockquote> element, so the indent is the only thing that marks one.
+constexpr qreal blockQuoteIndent = 40;
 
 // Noto ships a separate family per script, which buries every other font in
 // the picker. Offer only the core Latin families; the rest still serve as
@@ -96,6 +110,7 @@ Backend::Backend(QObject *parent) : QObject(parent) {
     m_editorFont = !savedFont.isEmpty() && QFontDatabase::hasFamily(savedFont)
         ? savedFont
         : defaultEditorFont();
+    m_previewVisible = QSettings().value(previewVisibleSetting, false).toBool();
 
     const QString stateDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(stateDirectory);
@@ -119,6 +134,9 @@ Backend::Backend(QObject *parent) : QObject(parent) {
     m_wordCountTimer.setSingleShot(true);
     m_wordCountTimer.setInterval(120);
     connect(&m_wordCountTimer, &QTimer::timeout, this, &Backend::refreshWordCount);
+    m_previewTimer.setSingleShot(true);
+    m_previewTimer.setInterval(previewRefreshIntervalMs);
+    connect(&m_previewTimer, &QTimer::timeout, this, &Backend::refreshPreview);
     m_recoveryTimer.setSingleShot(true);
     m_recoveryTimer.setInterval(750);
     connect(&m_recoveryTimer, &QTimer::timeout, this, &Backend::writeRecovery);
@@ -189,6 +207,8 @@ void Backend::setTextScale(qreal textScale) {
 
     m_textScale = textScale;
     emit textScaleChanged();
+    emit previewFontPixelSizeChanged();
+    schedulePreview();
 }
 
 void Backend::attachDocument(QObject *textDocument) {
@@ -217,6 +237,124 @@ void Backend::attachDocument(QObject *textDocument) {
 
     applyDocumentTypography();
     restoreRecovery();
+}
+
+void Backend::attachPreview(QObject *textDocument) {
+    auto *quickDocument = qobject_cast<QQuickTextDocument *>(textDocument);
+    if (!quickDocument || !quickDocument->textDocument()) {
+        setStatus(QStringLiteral("Could not attach the preview renderer."));
+        return;
+    }
+
+    m_previewDocument = quickDocument->textDocument();
+    refreshPreview();
+}
+
+void Backend::renderMarkdown(QTextDocument *target, const QString &text, const QFont &font,
+                             const QString &foreground, const QString &muted,
+                             const QString &accent) {
+    if (!target)
+        return;
+
+    target->setDefaultFont(font);
+    target->setDocumentMargin(0);
+    target->setMarkdown(text);
+
+    // Qt's Markdown writer bakes its own link colour onto every anchor and
+    // leaves headings and block quotes uncoloured, and a default stylesheet
+    // loses to the inline styles it writes. Restyle the blocks and the anchors
+    // directly so the result follows the theme instead.
+    QTextCharFormat bodyFormat;
+    bodyFormat.setForeground(QBrush(QColor(foreground)));
+    QTextCursor whole(target);
+    whole.select(QTextCursor::Document);
+    whole.mergeCharFormat(bodyFormat);
+
+    for (QTextBlock block = target->begin(); block.isValid(); block = block.next()) {
+        const QTextBlockFormat format = block.blockFormat();
+        const int level = format.headingLevel();
+        const bool heading = level >= 1 && level <= 6;
+        const bool quote = format.leftMargin() >= blockQuoteIndent;
+        if (!heading && !quote)
+            continue;
+
+        // setMarkdown flattens every block's margins to zero, which leaves
+        // headings jammed against the paragraph above them.
+        QTextBlockFormat blockFormat = format;
+        if (heading) {
+            const qreal lead = level == 1 ? 0.9 : (level == 2 ? 0.7 : 0.5);
+            blockFormat.setTopMargin(qRound(lead * font.pixelSize()));
+            blockFormat.setBottomMargin(qRound((level == 1 ? 0.3 : 0.2) * font.pixelSize()));
+        }
+
+        QTextCharFormat textFormat;
+        textFormat.setForeground(QBrush(QColor(quote ? muted : foreground)));
+
+        QTextCursor cursor(target);
+        cursor.setPosition(block.position());
+        cursor.setPosition(block.position() + block.length() - 1,
+                           QTextCursor::KeepAnchor);
+        cursor.mergeBlockFormat(blockFormat);
+        cursor.mergeCharFormat(textFormat);
+    }
+
+    // Anchors last, so the accent wins over the body colour applied above.
+    for (QTextBlock block = target->begin(); block.isValid(); block = block.next()) {
+        for (auto it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.isValid() || !fragment.charFormat().isAnchor())
+                continue;
+
+            QTextCharFormat linkFormat = fragment.charFormat();
+            linkFormat.setForeground(QBrush(QColor(accent)));
+            QTextCursor cursor(target);
+            cursor.setPosition(fragment.position());
+            cursor.setPosition(fragment.position() + fragment.length(),
+                               QTextCursor::KeepAnchor);
+            cursor.mergeCharFormat(linkFormat);
+        }
+    }
+}
+
+QString Backend::mutedColorFor(bool darkMode) {
+    return darkMode ? QStringLiteral("#909191") : QStringLiteral("#aeb1b5");
+}
+
+int Backend::previewFontPixelSize() const {
+    return qMax(1, qRound(basePreviewFontPixelSize * m_textScale));
+}
+
+QFont Backend::previewFont() const {
+    QFont font(m_editorFont);
+    font.setPixelSize(previewFontPixelSize());
+    return font;
+}
+
+void Backend::schedulePreview() {
+    if (!m_previewVisible || !m_previewDocument)
+        return;
+
+    m_previewTimer.start();
+}
+
+void Backend::refreshPreview() {
+    if (!m_previewDocument)
+        return;
+
+    m_previewTimer.stop();
+    renderMarkdown(m_previewDocument, currentDocumentText(), previewFont(),
+                   m_themeForeground, mutedColorFor(m_darkMode), m_themeAccent);
+}
+
+void Backend::setPreviewVisible(bool visible) {
+    if (m_previewVisible == visible)
+        return;
+
+    m_previewVisible = visible;
+    QSettings().setValue(previewVisibleSetting, visible);
+    if (visible)
+        refreshPreview();
+    emit previewVisibleChanged();
 }
 
 void Backend::openDialog() {
@@ -316,9 +454,12 @@ void Backend::printDocument() {
         dialog.windowHandle()->setTransientParent(m_parentWindow);
 
     if (dialog.exec() == QDialog::Accepted) {
+        // Paper is always light, so ask for ink-on-paper colours rather than
+        // the theme's, which in dark mode would print white text on white.
         QTextDocument rendered;
-        rendered.setDefaultFont(m_document->defaultFont());
-        rendered.setMarkdown(currentDocumentText());
+        renderMarkdown(&rendered, currentDocumentText(), m_document->defaultFont(),
+                       QStringLiteral("#000000"), QStringLiteral("#606060"),
+                       QStringLiteral("#0000ff"));
         rendered.print(&printer);
     }
 }
@@ -380,6 +521,7 @@ bool Backend::editorTextChanged() {
     }
 
     scheduleWordCount();
+    schedulePreview();
     setModified(true);
     setStatus(QStringLiteral("Unsaved"));
     scheduleRecovery();
@@ -458,6 +600,7 @@ void Backend::setEditorFont(const QString &family) {
     m_editorFont = family;
     QSettings().setValue(editorFontSetting, family);
     emit editorFontChanged();
+    schedulePreview();
 }
 
 QStringList Backend::availableFonts() const {
@@ -514,6 +657,10 @@ void Backend::loadDocumentText(const QString &text) {
     applyDocumentTypography();
     m_wordCountTimer.stop();
     setWordCount(countWords(text));
+    // A freshly opened document should appear rendered straight away rather
+    // than after the debounce the typing path uses.
+    m_previewTimer.stop();
+    refreshPreview();
 }
 
 void Backend::setFileUrl(const QUrl &url) {
@@ -720,6 +867,7 @@ void Backend::loadOmarchyTheme() {
     }
 
     emit themeColorsChanged();
+    schedulePreview();
 }
 
 void Backend::watchOmarchyTheme() {

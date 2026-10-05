@@ -4,6 +4,11 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickStyle>
+#include <QTextBlock>
+#include <QTextBlockFormat>
+#include <QTextCursor>
+#include <QTextDocument>
+#include <QTextFragment>
 
 #include "backend.h"
 #include "markdownhighlighter.h"
@@ -214,8 +219,8 @@ private slots:
         QVERIFY2(window, qPrintable(component.errorString()));
 
         QVERIFY(window->findChild<QObject *>(QStringLiteral("sourceEditor")));
-        QVERIFY(!window->findChild<QObject *>(QStringLiteral("renderedPreview")));
-        QVERIFY(!window->findChild<QObject *>(QStringLiteral("modeToggle")));
+        QVERIFY(window->findChild<QObject *>(QStringLiteral("renderedPreview")));
+        QVERIFY(window->findChild<QObject *>(QStringLiteral("modeToggle")));
 
         QObject *saveButton = window->findChild<QObject *>(QStringLiteral("saveButton"));
         QObject *openButton = window->findChild<QObject *>(QStringLiteral("openButton"));
@@ -229,6 +234,116 @@ private slots:
         QSignalSpy openDialogSpy(&backend, &Backend::openDialogRequested);
         QVERIFY(QMetaObject::invokeMethod(openButton, "clicked"));
         QCOMPARE(openDialogSpy.count(), 1);
+    }
+
+    void rendersThePreviewBesideTheEditor() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QObject *preview = window->findChild<QObject *>(QStringLiteral("renderedPreview"));
+        QVERIFY(editor);
+        QVERIFY(preview);
+        // The mirror is for reading; typing stays in the editor.
+        QVERIFY(preview->property("readOnly").toBool());
+
+        backend.setPreviewVisible(true);
+        editor->setProperty("text", QStringLiteral("# Title\n\nSome **bold** words "
+                                                    "and a [link](https://example.com)."));
+
+        // The backend fills the preview in on a short debounce. A rich-text
+        // document always reports some markup, so wait for the content itself.
+        QTRY_VERIFY(preview->property("text").toString().contains(QStringLiteral("Title")));
+        const QString rendered = preview->property("text").toString();
+        QVERIFY2(rendered.contains(QStringLiteral("bold")), qPrintable(rendered));
+        // The markers are gone, but the link text survives as a link.
+        QVERIFY(!rendered.contains(QStringLiteral("**")));
+        QVERIFY(!rendered.contains(QStringLiteral("[link]")));
+        QVERIFY(rendered.contains(QStringLiteral("link")));
+        QVERIFY(rendered.contains(QStringLiteral("https://example.com")));
+    }
+
+    void togglesThePreviewFromTheFooter() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+
+        Backend backend;
+        backend.setPreviewVisible(false);
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+
+        QObject *modeToggle = window->findChild<QObject *>(QStringLiteral("modeToggle"));
+        QVERIFY(modeToggle);
+
+        QSignalSpy previewSpy(&backend, &Backend::previewVisibleChanged);
+        QVERIFY(QMetaObject::invokeMethod(modeToggle, "clicked"));
+        QCOMPARE(previewSpy.count(), 1);
+        QVERIFY(backend.previewVisible());
+
+        QVERIFY(QMetaObject::invokeMethod(modeToggle, "clicked"));
+        QCOMPARE(previewSpy.count(), 2);
+        QVERIFY(!backend.previewVisible());
+    }
+
+    void remembersWhetherThePreviewWasShown() {
+        Backend backend;
+        QCOMPARE(backend.previewVisible(), false);
+        backend.setPreviewVisible(true);
+        QCOMPARE(Backend().previewVisible(), true);
+        backend.setPreviewVisible(false);
+        QCOMPARE(Backend().previewVisible(), false);
+    }
+
+    void paintsThePreviewInTheThemeColours() {
+        QFont font(QStringLiteral("IBM Plex Mono"));
+        font.setPixelSize(20);
+
+        QTextDocument document;
+        Backend::renderMarkdown(&document, QStringLiteral("## Heading\n\n> quoted\n\n"
+                                                         "[link](https://example.com)"),
+                                font, QStringLiteral("#101010"), QStringLiteral("#606060"),
+                                QStringLiteral("#00ff00"));
+
+        // Headings get breathing room, since setMarkdown zeroes every margin.
+        const QTextBlock heading = document.begin();
+        QCOMPARE(heading.blockFormat().headingLevel(), 2);
+        QVERIFY(heading.blockFormat().topMargin() > 0);
+
+        QString quoteColor;
+        QString linkColor;
+        QString bodyColor;
+        for (QTextBlock block = document.begin(); block.isValid(); block = block.next()) {
+            for (auto it = block.begin(); !it.atEnd(); ++it) {
+                const QTextFragment fragment = it.fragment();
+                if (!fragment.isValid())
+                    continue;
+                const QString colour =
+                    fragment.charFormat().foreground().color().name();
+                if (fragment.charFormat().isAnchor())
+                    linkColor = colour;
+                else if (block.blockFormat().leftMargin() >= 40)
+                    quoteColor = colour;
+                else if (colour != QStringLiteral("#101010"))
+                    bodyColor = colour;
+            }
+        }
+
+        // Qt writes its own blue onto anchors; the accent has to replace it.
+        QCOMPARE(linkColor, QStringLiteral("#00ff00"));
+        QCOMPARE(quoteColor, QStringLiteral("#606060"));
+        QVERIFY(bodyColor.isEmpty());
     }
 
     void scalesTextWithDesktopTextSize() {
